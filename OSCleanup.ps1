@@ -242,27 +242,29 @@ function Test-InstallerBusy {
 function Test-OfficeClickToRunBusy {
     $busy = $false
 
-    $c2rProcesses = @(
-        "OfficeClickToRun",
-        "OfficeC2RClient",
-        "IntegratedOffice",
-        "setup"
-    )
+    try {
+        # Look for processes that actually indicate an Office install/repair, not the always-on service host
+        $procFilter = "Name='setup.exe' OR Name='OfficeC2RClient.exe' OR Name='IntegratedOffice.exe'"
+        $procs = Get-CimInstance Win32_Process -Filter $procFilter -ErrorAction SilentlyContinue
 
-    foreach ($name in $c2rProcesses) {
-        try {
-            $p = Get-Process -Name $name -ErrorAction SilentlyContinue
-            if ($p) {
-                Write-Log "Office Click-to-Run activity detected: $name (Count: $($p.Count))" "WARN"
+        foreach ($p in $procs) {
+            $cmd = $p.CommandLine
+            if ($cmd -and ($cmd -match "Office" -or $cmd -match "ClickToRun" -or $cmd -match "C2R")) {
+                Write-Log "Office Click-to-Run install/maintenance activity detected: $($p.Name) (PID $($p.ProcessId)) CMD: $cmd" "WARN"
                 $busy = $true
             }
-        } catch {
-            # ignore individual process lookup failures
         }
+
+        if (-not $busy) {
+            Write-Log "No Office Click-to-Run install/repair/update activity detected (background OfficeClickToRun.exe is ignored)." "INFO"
+        }
+    } catch {
+        Write-Log "Error checking Office Click-to-Run activity. $_" "WARN"
     }
 
     return $busy
 }
+
 
 # ================================
 #  Reset: Installer-related Services
