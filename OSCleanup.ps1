@@ -6,7 +6,7 @@
     - Must be run as Administrator.
     - Does NOT attempt to fix corruption; focuses on state sanity and safe junk cleanup.
     - Pre-flight checks (with exit codes):
-        * Pending reboot detection
+        * Pending reboot detection (CBS / Windows Update only)
         * Windows Installer busy (msiexec / InProgress key)
         * Office Click-to-Run busy
         * Installer service restart issues
@@ -34,7 +34,7 @@
 .EXIT CODES
     0  = Success; pre-flight OK; cleanup completed.
     1  = General script error.
-    20 = Pending reboot detected.
+    20 = Pending reboot detected (CBS or Windows Update).
     21 = Windows Installer busy (msiexec or InProgress key).
     22 = Office Click-to-Run installation/maintenance busy.
     23 = Installer services failed to restart/start cleanly.
@@ -174,7 +174,7 @@ function Remove-ItemSafe {
 }
 
 # ================================
-#  Check: Pending Reboot
+#  Check: Pending Reboot (CBS / WU only)
 # ================================
 function Test-PendingReboot {
     $pending = $false
@@ -191,13 +191,12 @@ function Test-PendingReboot {
         $pending = $true
     }
 
-    # Pending file rename operations
+    # PendingFileRenameOperations is common (Chrome, etc.) -> LOG ONLY, DO NOT TRIP EXIT CODE
     try {
         $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
         $value = Get-ItemProperty -Path $regPath -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue
         if ($value -and $value.PendingFileRenameOperations) {
-            Write-Log "Pending reboot detected: PendingFileRenameOperations present" "WARN"
-            $pending = $true
+            Write-Log "PendingFileRenameOperations present (common for app updates; not treated as a hard reboot block)." "INFO"
         }
     } catch {
         Write-Log "Error checking PendingFileRenameOperations. $_" "WARN"
@@ -668,7 +667,7 @@ if (Test-PendingReboot) {
     Write-Log "Pending reboot detected — installation should not proceed." "WARN"
     $exitCode = 20
 } else {
-    Write-Log "No reboot-pending indicators detected."
+    Write-Log "No reboot-pending indicators detected (CBS/Windows Update)."
 }
 
 if (Test-InstallerBusy) {
