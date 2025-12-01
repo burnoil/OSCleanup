@@ -1,20 +1,26 @@
 <#
 .SYNOPSIS
-    Cleans up common Windows OS junk to help prevent MSI / Click-to-Run errors (e.g., 1603).
+    Cleans up common Windows OS junk and checks system state to help prevent MSI / Click-to-Run install issues (e.g., 1603).
 
 .DESCRIPTION
-    - Must be run as Administrator
-    - Cleans:
+    - Must be run as Administrator.
+    - Does NOT attempt to fix corruption; focuses on state sanity and safe junk cleanup.
+    - Pre-flight checks (with exit codes):
+        * Pending reboot detection
+        * Windows Installer busy (msiexec / InProgress key)
+        * Office Click-to-Run busy
+        * Installer service restart issues
+    - Cleanup:
         * User & system temp folders
         * All user profile temp folders (C:\Users\*\AppData\Local\Temp)
         * Windows Update download cache
         * Delivery Optimization cache
-        * Office Click-to-Run logs/telemetry/cache (non-destructive, no binaries)
-        * Old CBS/DISM logs & CAB files
+        * Office Click-to-Run logs/telemetry/cache (non-destructive; no binaries)
+        * Old CBS/DISM/MoSetup logs & CAB files
         * Windows Installer logs/temp files (NOT the MSI/MSP cache)
         * Recycle Bin (optional)
+        * Optional aggressive WER queue cleanup
     - Logs all actions to %ProgramData%\OSCleanup\OSCleanup_yyyyMMdd_HHmmss.log
-    - Logs if a reboot is pending (common installer failure cause)
 
 .PARAMETER Aggressive
     Enables extra cleanup (currently Windows Error Reporting queue).
@@ -23,13 +29,24 @@
     Skips clearing the Recycle Bin.
 
 .PARAMETER WhatIf
-    Shows what would be deleted without actually deleting anything.
+    Shows what would be deleted / restarted without actually doing it.
+
+.EXIT CODES
+    0  = Success; pre-flight OK; cleanup completed.
+    1  = General script error.
+    20 = Pending reboot detected.
+    21 = Windows Installer busy (msiexec or InProgress key).
+    22 = Office Click-to-Run installation/maintenance busy.
+    23 = Installer services failed to restart/start cleanly.
 
 .EXAMPLE
-    .\Invoke-OsCleanup.ps1 -Aggressive
+    .\Invoke-OSPreflightCleanup.ps1 -Aggressive
 
 .EXAMPLE
-    .\Invoke-OsCleanup.ps1 -WhatIf
+    .\Invoke-OSPreflightCleanup.ps1 -SkipRecycleBin
+
+.EXAMPLE
+    .\Invoke-OSPreflightCleanup.ps1 -WhatIf
 #>
 
 param(
@@ -62,7 +79,7 @@ function Write-Log {
 }
 
 Write-Log "============================================================="
-Write-Log "Starting OS cleanup script"
+Write-Log "Starting OS pre-flight + cleanup script"
 Write-Log "Parameters: Aggressive=$Aggressive; SkipRecycleBin=$SkipRecycleBin; WhatIf=$WhatIf"
 
 # ================================
@@ -189,14 +206,111 @@ function Test-PendingReboot {
     return $pending
 }
 
-if (Test-PendingReboot) {
-    Write-Log "One or more reboot-pending indicators found. A reboot before installation is strongly recommended." "WARN"
-} else {
-    Write-Log "No reboot-pending indicators detected."
+# ================================
+#  Check: Installer Busy
+# ================================
+function Test-InstallerBusy {
+    $busy = $false
+
+    # Check for active msiexec.exe processes
+    try {
+        $msi = Get-Process -Name "msiexec" -ErrorAction SilentlyContinue
+        if ($msi) {
+            Write-Log "Windows Installer busy: msiexec.exe running (Count: $($msi.Count))" "WARN"
+            $busy = $true
+        }
+    } catch {
+        Write-Log "Error checking msiexec.exe. $_" "WARN"
+    }
+
+    # Check Installer\InProgress key
+    try {
+        $key = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress"
+        if (Test-Path $key) {
+            Write-Log "Installer 'InProgress' key exists — another installation is in progress or stuck." "WARN"
+            $busy = $true
+        }
+    } catch {
+        Write-Log "Error checking installer state. $_" "WARN"
+    }
+
+    return $busy
 }
 
 # ================================
-#  Cleanup: Temp Folders (Current user + system)
+#  Check: Office Click-to-Run Busy
+# ================================
+function Test-OfficeClickToRunBusy {
+    $busy = $false
+
+    $c2rProcesses = @(
+        "OfficeClickToRun",
+        "OfficeC2RClient",
+        "IntegratedOffice",
+        "setup"
+    )
+
+    foreach ($name in $c2rProcesses) {
+        try {
+            $p = Get-Process -Name $name -ErrorAction SilentlyContinue
+            if ($p) {
+                Write-Log "Office Click-to-Run activity detected: $name (Count: $($p.Count))" "WARN"
+                $busy = $true
+            }
+        } catch {
+            # ignore individual process lookup failures
+        }
+    }
+
+    return $busy
+}
+
+# ================================
+#  Reset: Installer-related Services
+# ================================
+function Reset-InstallServices {
+    Write-Log "----- Resetting Installer-related services -----"
+    $errorDuringRestart = $false
+
+    $services = @(
+        "msiserver",      # Windows Installer
+        "ClickToRunSvc"   # Office C2R (if present)
+    )
+
+    foreach ($svcName in $services) {
+        try {
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if (-not $svc) {
+                Write-Log "Service '$svcName' not present (OK)" "INFO"
+                continue
+            }
+
+            if ($svc.Status -eq "Running") {
+                Write-Log "Restarting service '$svcName'"
+                if (-not $WhatIf) {
+                    Restart-Service -Name $svcName -Force -ErrorAction Stop
+                } else {
+                    Write-Log "WhatIf: Would restart service '$svcName'"
+                }
+            } else {
+                Write-Log "Starting service '$svcName' (current state: $($svc.Status))"
+                if (-not $WhatIf) {
+                    Start-Service -Name $svcName -ErrorAction Stop
+                } else {
+                    Write-Log "WhatIf: Would start service '$svcName'"
+                }
+            }
+        } catch {
+            Write-Log "Failed to restart/start '$svcName'. $_" "WARN"
+            $errorDuringRestart = $true
+        }
+    }
+
+    return $errorDuringRestart
+}
+
+# ================================
+#  Cleanup: Temp Folders (current user + system)
 # ================================
 function Clear-TempFolders {
     Write-Log "----- Clearing temp folders (current user + system) -----"
@@ -440,10 +554,10 @@ function Clear-OfficeClickToRunJunk {
 }
 
 # ================================
-#  Cleanup: Old System Logs (CBS / DISM / Temp CAB)
+#  Cleanup: Old System Logs (CBS / DISM / MoSetup / Temp CAB)
 # ================================
 function Clear-OldSystemLogs {
-    Write-Log "----- Clearing old CBS/DISM logs and CABs -----"
+    Write-Log "----- Clearing old CBS/DISM/MoSetup logs and CABs -----"
 
     $patterns = @(
         "C:\Windows\Logs\CBS\*.cab",
@@ -468,7 +582,7 @@ function Clear-OldSystemLogs {
 }
 
 # ================================
-#  Cleanup: Windows Installer Logs / Temp (Not MSI/MSP cache)
+#  Cleanup: Windows Installer Logs / Temp (not MSI/MSP cache)
 # ================================
 function Clear-WindowsInstallerLogs {
     Write-Log "----- Clearing Windows Installer logs/temp files (not MSI/MSP cache) -----"
@@ -547,6 +661,45 @@ function Invoke-AggressiveCleanup {
 # ================================
 #  MAIN EXECUTION
 # ================================
+$exitCode = 0
+
+# Pre-flight checks
+if (Test-PendingReboot) {
+    Write-Log "Pending reboot detected — installation should not proceed." "WARN"
+    $exitCode = 20
+} else {
+    Write-Log "No reboot-pending indicators detected."
+}
+
+if (Test-InstallerBusy) {
+    Write-Log "Windows Installer is busy — installation should not proceed." "WARN"
+    if ($exitCode -eq 0) { $exitCode = 21 }
+} else {
+    Write-Log "No active Windows Installer activity detected."
+}
+
+if (Test-OfficeClickToRunBusy) {
+    Write-Log "Office Click-to-Run installer/maintenance activity detected." "WARN"
+    if ($exitCode -eq 0) { $exitCode = 22 }
+} else {
+    Write-Log "No obvious Office Click-to-Run install activity detected."
+}
+
+$svcErrors = Reset-InstallServices
+if ($svcErrors) {
+    Write-Log "One or more installer services failed to restart/start cleanly." "WARN"
+    if ($exitCode -eq 0) { $exitCode = 23 }
+}
+
+if ($exitCode -ne 0) {
+    Write-Log "Pre-flight checks indicate system is NOT ready for installation. ExitCode=$exitCode"
+    Write-Log "Cleanup will be skipped due to pre-flight failure."
+    Write-Log "============================================================="
+    exit $exitCode
+}
+
+Write-Log "System passes pre-flight checks. Proceeding with cleanup..."
+
 try {
     Clear-TempFolders
     Clear-UserProfileTempFolders
@@ -561,7 +714,8 @@ try {
         Invoke-AggressiveCleanup
     }
 } catch {
-    Write-Log "Unexpected error during main cleanup: $_" "ERROR"
+    Write-Log "Unexpected error during cleanup: $_" "ERROR"
+    if ($exitCode -eq 0) { $exitCode = 1 }
 }
 
 $finalFree = Get-SystemDriveFreeSpace
@@ -569,10 +723,13 @@ $delta = $finalFree - $initialFree
 
 Write-Log "Final free space on system drive ($env:SystemDrive): $(Format-Bytes $finalFree)"
 Write-Log "Approximate space reclaimed: $(Format-Bytes $delta)"
-Write-Log "Cleanup script finished."
+Write-Log "Cleanup script finished with ExitCode=$exitCode."
 Write-Log "Log file: $script:LogFile"
 Write-Log "============================================================="
 
 Write-Host ""
 Write-Host "Cleanup complete. Approx. space reclaimed: $(Format-Bytes $delta)" -ForegroundColor Cyan
+Write-Host "Pre-flight ExitCode: $exitCode" -ForegroundColor Cyan
 Write-Host "Log file: $script:LogFile" -ForegroundColor Cyan
+
+exit $exitCode
