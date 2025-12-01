@@ -239,27 +239,48 @@ function Test-InstallerBusy {
 # ================================
 #  Check: Office Click-to-Run Busy
 # ================================
-function Test-OfficeClickToRunBusy {
+function Test-InstallerBusy {
     $busy = $false
 
     try {
-        # Look for processes that actually indicate an Office install/repair, not the always-on service host
-        $procFilter = "Name='setup.exe' OR Name='OfficeC2RClient.exe' OR Name='IntegratedOffice.exe'"
-        $procs = Get-CimInstance Win32_Process -Filter $procFilter -ErrorAction SilentlyContinue
+        # Look at running msiexec.exe processes and inspect their command lines
+        $procs = Get-CimInstance Win32_Process -Filter "Name='msiexec.exe'" -ErrorAction SilentlyContinue
 
-        foreach ($p in $procs) {
-            $cmd = $p.CommandLine
-            if ($cmd -and ($cmd -match "Office" -or $cmd -match "ClickToRun" -or $cmd -match "C2R")) {
-                Write-Log "Office Click-to-Run install/maintenance activity detected: $($p.Name) (PID $($p.ProcessId)) CMD: $cmd" "WARN"
-                $busy = $true
+        if ($procs) {
+            foreach ($p in $procs) {
+                $cmd = $p.CommandLine
+
+                # Treat as "busy" only if the command line clearly indicates an install/repair/uninstall
+                if ($cmd -and ($cmd -match '/i' -or
+                               $cmd -match '/x' -or
+                               $cmd -match '/f' -or
+                               $cmd -match '/update' -or
+                               $cmd -match '/package' -or
+                               $cmd -match 'REBOOT=' -or
+                               $cmd -match 'INSTALL' -or
+                               $cmd -match 'UNINSTALL')) {
+
+                    Write-Log "Windows Installer busy: msiexec.exe (PID $($p.ProcessId)) with install-related command line: $cmd" "WARN"
+                    $busy = $true
+                } else {
+                    Write-Log "msiexec.exe (PID $($p.ProcessId)) running with non-install command line (ignored as busy): $cmd" "INFO"
+                }
             }
-        }
-
-        if (-not $busy) {
-            Write-Log "No Office Click-to-Run install/repair/update activity detected (background OfficeClickToRun.exe is ignored)." "INFO"
+        } else {
+            Write-Log "No msiexec.exe processes detected." "INFO"
         }
     } catch {
-        Write-Log "Error checking Office Click-to-Run activity. $_" "WARN"
+        Write-Log "Error checking msiexec.exe via Win32_Process. $_" "WARN"
+    }
+
+    # Installer\InProgress key: log only, do NOT treat as hard block (can be orphaned)
+    try {
+        $key = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress"
+        if (Test-Path $key) {
+            Write-Log "Installer 'InProgress' key exists (logged for visibility, but not treated as a hard block)." "INFO"
+        }
+    } catch {
+        Write-Log "Error checking Installer InProgress key. $_" "WARN"
     }
 
     return $busy
