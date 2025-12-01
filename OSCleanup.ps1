@@ -7,8 +7,8 @@
     - Does NOT attempt to fix corruption; focuses on state sanity and safe junk cleanup.
     - Pre-flight checks (with exit codes):
         * Pending reboot detection (CBS / Windows Update only)
-        * Windows Installer busy (msiexec / InProgress key)
-        * Office Click-to-Run busy
+        * Windows Installer busy (msiexec with recent, install-related command line)
+        * Office Click-to-Run busy (actual setup/repair/update, not just background service)
         * Installer service restart issues
     - Cleanup:
         * User & system temp folders
@@ -35,7 +35,7 @@
     0  = Success; pre-flight OK; cleanup completed.
     1  = General script error.
     20 = Pending reboot detected (CBS or Windows Update).
-    21 = Windows Installer busy (msiexec or InProgress key).
+    21 = Windows Installer busy (recent, install-like msiexec).
     22 = Office Click-to-Run installation/maintenance busy.
     23 = Installer services failed to restart/start cleanly.
 
@@ -54,6 +54,9 @@ param(
     [switch]$SkipRecycleBin,
     [switch]$WhatIf
 )
+
+# How recent an msiexec.exe must be (in minutes) to count as "busy"
+[int]$script:InstallerBusyMinutes = 120
 
 # ================================
 #  Logging Setup
@@ -206,64 +209,54 @@ function Test-PendingReboot {
 }
 
 # ================================
-#  Check: Installer Busy
-# ================================
-function Test-InstallerBusy {
-    $busy = $false
-
-    # Check for active msiexec.exe processes
-    try {
-        $msi = Get-Process -Name "msiexec" -ErrorAction SilentlyContinue
-        if ($msi) {
-            Write-Log "Windows Installer busy: msiexec.exe running (Count: $($msi.Count))" "WARN"
-            $busy = $true
-        }
-    } catch {
-        Write-Log "Error checking msiexec.exe. $_" "WARN"
-    }
-
-    # Check Installer\InProgress key
-    try {
-        $key = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress"
-        if (Test-Path $key) {
-            Write-Log "Installer 'InProgress' key exists — another installation is in progress or stuck." "WARN"
-            $busy = $true
-        }
-    } catch {
-        Write-Log "Error checking installer state. $_" "WARN"
-    }
-
-    return $busy
-}
-
-# ================================
-#  Check: Office Click-to-Run Busy
+#  Check: Installer Busy (conservative)
 # ================================
 function Test-InstallerBusy {
     $busy = $false
 
     try {
-        # Look at running msiexec.exe processes and inspect their command lines
         $procs = Get-CimInstance Win32_Process -Filter "Name='msiexec.exe'" -ErrorAction SilentlyContinue
-
         if ($procs) {
+            $now = Get-Date
             foreach ($p in $procs) {
                 $cmd = $p.CommandLine
+                $started = $null
+                try {
+                    if ($p.CreationDate) {
+                        $started = [Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate)
+                    }
+                } catch {}
 
-                # Treat as "busy" only if the command line clearly indicates an install/repair/uninstall
-                if ($cmd -and ($cmd -match '/i' -or
-                               $cmd -match '/x' -or
-                               $cmd -match '/f' -or
-                               $cmd -match '/update' -or
-                               $cmd -match '/package' -or
-                               $cmd -match 'REBOOT=' -or
-                               $cmd -match 'INSTALL' -or
-                               $cmd -match 'UNINSTALL')) {
+                $ageMinutes = $null
+                if ($started) {
+                    $ageMinutes = ($now - $started).TotalMinutes
+                }
 
-                    Write-Log "Windows Installer busy: msiexec.exe (PID $($p.ProcessId)) with install-related command line: $cmd" "WARN"
+                $isRecent = $false
+                if ($ageMinutes -ne $null -and $ageMinutes -le $script:InstallerBusyMinutes) {
+                    $isRecent = $true
+                }
+
+                # Command line patterns that usually indicate real install/repair/uninstall work
+                $installLike = $false
+                if ($cmd -and (
+                        $cmd -match '/i' -or
+                        $cmd -match '/x' -or
+                        $cmd -match '/f' -or
+                        $cmd -match '/update' -or
+                        $cmd -match '/package' -or
+                        $cmd -match 'REBOOT=' -or
+                        $cmd -match 'INSTALL' -or
+                        $cmd -match 'UNINSTALL'
+                    )) {
+                    $installLike = $true
+                }
+
+                if ($isRecent -and $installLike) {
+                    Write-Log "Windows Installer busy: msiexec.exe (PID $($p.ProcessId)) started $started (~$([math]::Round($ageMinutes,1)) min ago) with install-like command line: $cmd" "WARN"
                     $busy = $true
                 } else {
-                    Write-Log "msiexec.exe (PID $($p.ProcessId)) running with non-install command line (ignored as busy): $cmd" "INFO"
+                    Write-Log "msiexec.exe (PID $($p.ProcessId)) ignored as busy (Recent=$isRecent, InstallLike=$installLike). CmdLine: $cmd" "INFO"
                 }
             }
         } else {
@@ -273,7 +266,7 @@ function Test-InstallerBusy {
         Write-Log "Error checking msiexec.exe via Win32_Process. $_" "WARN"
     }
 
-    # Installer\InProgress key: log only, do NOT treat as hard block (can be orphaned)
+    # Installer\InProgress key: log only, do NOT treat as hard block
     try {
         $key = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress"
         if (Test-Path $key) {
@@ -286,6 +279,36 @@ function Test-InstallerBusy {
     return $busy
 }
 
+# ================================
+#  Check: Office Click-to-Run Busy (conservative)
+# ================================
+function Test-OfficeClickToRunBusy {
+    $busy = $false
+
+    try {
+        # Look for processes that actually indicate Office install/repair/update, not the always-on service host
+        $procFilter = "Name='setup.exe' OR Name='OfficeC2RClient.exe' OR Name='IntegratedOffice.exe'"
+        $procs = Get-CimInstance Win32_Process -Filter $procFilter -ErrorAction SilentlyContinue
+
+        if ($procs) {
+            foreach ($p in $procs) {
+                $cmd = $p.CommandLine
+                if ($cmd -and ($cmd -match "Office" -or $cmd -match "ClickToRun" -or $cmd -match "C2R")) {
+                    Write-Log "Office Click-to-Run install/maintenance activity detected: $($p.Name) (PID $($p.ProcessId)) CMD: $cmd" "WARN"
+                    $busy = $true
+                } else {
+                    Write-Log "$($p.Name) (PID $($p.ProcessId)) does not look like Office C2R install; ignoring. CmdLine: $cmd" "INFO"
+                }
+            }
+        } else {
+            Write-Log "No Office setup/repair processes detected (background OfficeClickToRun.exe is ignored)." "INFO"
+        }
+    } catch {
+        Write-Log "Error checking Office Click-to-Run activity. $_" "WARN"
+    }
+
+    return $busy
+}
 
 # ================================
 #  Reset: Installer-related Services
@@ -697,7 +720,7 @@ if (Test-InstallerBusy) {
     Write-Log "Windows Installer is busy — installation should not proceed." "WARN"
     if ($exitCode -eq 0) { $exitCode = 21 }
 } else {
-    Write-Log "No active Windows Installer activity detected."
+    Write-Log "No active Windows Installer activity detected (per conservative rules)."
 }
 
 if (Test-OfficeClickToRunBusy) {
@@ -717,6 +740,9 @@ if ($exitCode -ne 0) {
     Write-Log "Pre-flight checks indicate system is NOT ready for installation. ExitCode=$exitCode"
     Write-Log "Cleanup will be skipped due to pre-flight failure."
     Write-Log "============================================================="
+    Write-Host ""
+    Write-Host "Pre-flight failed. ExitCode: $exitCode" -ForegroundColor Yellow
+    Write-Host "See log for details: $script:LogFile" -ForegroundColor Yellow
     exit $exitCode
 }
 
