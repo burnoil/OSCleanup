@@ -769,15 +769,24 @@ try {
 $finalFree = Get-SystemDriveFreeSpace
 $delta = $finalFree - $initialFree
 
+# If free space decreased slightly during the run (normal OS churn), don't show a negative "reclaimed" value
+if ($delta -lt 0) {
+    Write-Log "Note: free space decreased by $(Format-Bytes ([math]::Abs($delta))) during script execution (normal background activity). Reporting 0 B reclaimed." "INFO"
+    $deltaShown = 0
+} else {
+    $deltaShown = $delta
+}
+
 Write-Log "Final free space on system drive ($env:SystemDrive): $(Format-Bytes $finalFree)"
-Write-Log "Approximate space reclaimed: $(Format-Bytes $delta)"
+Write-Log "Approximate space reclaimed: $(Format-Bytes $deltaShown)"
 Write-Log "Cleanup script finished with ExitCode=$exitCode."
 Write-Log "Log file: $script:LogFile"
 Write-Log "============================================================="
 
 Write-Host ""
-Write-Host "Cleanup complete. Approx. space reclaimed: $(Format-Bytes $delta)" -ForegroundColor Cyan
+Write-Host "Cleanup complete. Approx. space reclaimed: $(Format-Bytes $deltaShown)" -ForegroundColor Cyan
 Write-Host "Pre-flight ExitCode: $exitCode" -ForegroundColor Cyan
 Write-Host "Log file: $script:LogFile" -ForegroundColor Cyan
 
 exit $exitCode
+
