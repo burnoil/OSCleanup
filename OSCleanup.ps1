@@ -1,65 +1,57 @@
 <#
 .SYNOPSIS
-    Cleans up common Windows OS junk and checks system state to help prevent MSI / Click-to-Run install issues (e.g., 1603).
+    Cleans up Windows OS junk and performs optional pre-flight checks
+    to help prevent MSI / Click-to-Run install issues (e.g., 1603).
 
 .DESCRIPTION
     - Must be run as Administrator.
-    - Does NOT attempt to fix corruption; focuses on state sanity and safe junk cleanup.
-    - Pre-flight checks (with exit codes):
-        * Pending reboot detection (CBS / Windows Update only)
-        * Windows Installer busy (msiexec with recent, install-related command line)
-        * Office Click-to-Run busy (actual setup/repair/update, not just background service)
-        * Installer service restart issues
-    - Cleanup:
-        * User & system temp folders
-        * All user profile temp folders (C:\Users\*\AppData\Local\Temp)
-        * Windows Update download cache
-        * Delivery Optimization cache
-        * Office Click-to-Run logs/telemetry/cache (non-destructive; no binaries)
-        * Old CBS/DISM/MoSetup logs & CAB files
-        * Windows Installer logs/temp files (NOT the MSI/MSP cache)
-        * Recycle Bin (optional)
-        * Optional aggressive WER queue cleanup
-    - Logs all actions to %ProgramData%\OSCleanup\OSCleanup_yyyyMMdd_HHmmss.log
+    - Performs safe OS cleanup operations.
+    - Optional pre-flight detection for:
+        * Pending reboot
+        * Installer busy (msiexec)
+        * Office C2R busy (real installs, not background)
+        * Installer service restart failures
+    - Supports silent operation via -Silent
+    - Logging to %ProgramData%\OSCleanup
 
 .PARAMETER Aggressive
-    Enables extra cleanup (currently Windows Error Reporting queue).
+    Enables additional cleanup (WER queue, etc).
 
 .PARAMETER SkipRecycleBin
     Skips clearing the Recycle Bin.
 
+.PARAMETER SkipPreflight
+    Runs cleanup only and bypasses all pre-flight checks.
+
+.PARAMETER InstallerBusyMinutes
+    How recent an msiexec must be (minutes) to count as busy. Default: 120.
+
 .PARAMETER WhatIf
-    Shows what would be deleted / restarted without actually doing it.
+    Shows what would happen but makes no changes.
 
-.EXIT CODES
-    0  = Success; pre-flight OK; cleanup completed.
-    1  = General script error.
-    20 = Pending reboot detected (CBS or Windows Update).
-    21 = Windows Installer busy (recent, install-like msiexec).
-    22 = Office Click-to-Run installation/maintenance busy.
-    23 = Installer services failed to restart/start cleanly.
+.PARAMETER Silent
+    Suppresses all console output. Script still writes full logs.
 
-.EXAMPLE
-    .\Invoke-OSPreflightCleanup.ps1 -Aggressive
-
-.EXAMPLE
-    .\Invoke-OSPreflightCleanup.ps1 -SkipRecycleBin
-
-.EXAMPLE
-    .\Invoke-OSPreflightCleanup.ps1 -WhatIf
+.EXITCODES
+    0  Success (or preflight skipped)
+    1  General script error
+    20 Pending reboot
+    21 Installer busy
+    22 Office C2R busy
+    23 Installer service restart failure
 #>
 
 param(
     [switch]$Aggressive,
     [switch]$SkipRecycleBin,
-    [switch]$WhatIf
+    [switch]$SkipPreflight,
+    [int]$InstallerBusyMinutes = 120,
+    [switch]$WhatIf,
+    [switch]$Silent
 )
 
-# How recent an msiexec.exe must be (in minutes) to count as "busy"
-[int]$script:InstallerBusyMinutes = 120
-
 # ================================
-#  Logging Setup
+# Logging Setup
 # ================================
 $script:LogRoot = Join-Path -Path $env:ProgramData -ChildPath "OSCleanup"
 if (-not (Test-Path $script:LogRoot)) {
@@ -70,479 +62,290 @@ $script:LogFile = Join-Path $script:LogRoot "OSCleanup_$timestamp.log"
 
 function Write-Log {
     param(
-        [Parameter(Mandatory)]
-        [string]$Message,
-        [ValidateSet("INFO","WARN","ERROR")]
-        [string]$Level = "INFO"
+        [Parameter(Mandatory)] [string]$Message,
+        [ValidateSet("INFO","WARN","ERROR")] [string]$Level = "INFO"
     )
+
     $time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$time] [$Level] $Message"
-    Write-Host $line
+
+    # No console output when -Silent is used
+    if (-not $Silent) {
+        Write-Host $line
+    }
+
     Add-Content -Path $script:LogFile -Value $line
 }
 
 Write-Log "============================================================="
-Write-Log "Starting OS pre-flight + cleanup script"
-Write-Log "Parameters: Aggressive=$Aggressive; SkipRecycleBin=$SkipRecycleBin; WhatIf=$WhatIf"
+Write-Log "Starting OS Preflight Cleanup Script"
+Write-Log "Parameters: Aggressive=$Aggressive SkipRecycleBin=$SkipRecycleBin SkipPreflight=$SkipPreflight InstallerBusyMinutes=$InstallerBusyMinutes WhatIf=$WhatIf Silent=$Silent"
 
 # ================================
-#  Admin Check
+# Admin Check
 # ================================
 function Test-IsAdmin {
-    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+    $wid = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($wid)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 if (-not (Test-IsAdmin)) {
-    Write-Host "This script must be run as Administrator." -ForegroundColor Red
-    Write-Host "Right-click PowerShell and select 'Run as administrator', then run this script again."
+    if (-not $Silent) {
+        Write-Host "ERROR: Script must be run as Administrator." -ForegroundColor Red
+    }
     exit 1
 }
 
 # ================================
-#  Helper: Size / Free Space
+# Helpers
 # ================================
 function Format-Bytes {
-    param(
-        [Parameter(Mandatory)]
-        [Int64]$Bytes
-    )
-    if ($Bytes -ge 1GB) {
-        return ("{0:N2} GB" -f ($Bytes / 1GB))
-    } elseif ($Bytes -ge 1MB) {
-        return ("{0:N2} MB" -f ($Bytes / 1MB))
-    } elseif ($Bytes -ge 1KB) {
-        return ("{0:N2} KB" -f ($Bytes / 1KB))
-    } else {
-        return "$Bytes B"
-    }
+    param([Int64]$Bytes)
+    if ($Bytes -ge 1GB) { "{0:N2} GB" -f ($Bytes / 1GB) }
+    elseif ($Bytes -ge 1MB) { "{0:N2} MB" -f ($Bytes / 1MB) }
+    elseif ($Bytes -ge 1KB) { "{0:N2} KB" -f ($Bytes / 1KB) }
+    else { "$Bytes B" }
 }
 
 function Get-SystemDriveFreeSpace {
     try {
-        $root = $env:SystemDrive  # e.g. 'C:'
-        if (-not $root) {
-            Write-Log "SystemDrive environment variable not found; defaulting to C:" "WARN"
-            $root = "C:"
-        }
-        $root = $root.TrimEnd('\')
-
-        $driveLetter = $root.Substring(0,1)  # 'C'
+        $root = $env:SystemDrive.TrimEnd('\')
+        $driveLetter = $root.Substring(0,1)
         $drive = Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue
 
         if ($drive) {
             return [int64]$drive.Free
-        } else {
-            # Fallback via WMI
-            $sys = Get-WmiObject Win32_LogicalDisk -Filter "DeviceID='$root'" -ErrorAction SilentlyContinue
-            if ($sys) {
-                return [int64]$sys.FreeSpace
-            }
         }
-    } catch {
-        Write-Log "Failed to get system drive free space. $_" "WARN"
+
+        $fallback = Get-WmiObject Win32_LogicalDisk -Filter "DeviceID='$root'" -ErrorAction SilentlyContinue
+        if ($fallback) { return [int64]$fallback.FreeSpace }
+    }
+    catch {
+        Write-Log "Get-SystemDriveFreeSpace failed: $_" "WARN"
     }
     return 0
 }
 
 $initialFree = Get-SystemDriveFreeSpace
-Write-Log "Initial free space on system drive ($env:SystemDrive): $(Format-Bytes $initialFree)"
+Write-Log "Initial free space: $(Format-Bytes $initialFree)"
 
 # ================================
-#  Helper: Safe Delete Wrapper
+# Safe Remove Wrapper
 # ================================
 function Remove-ItemSafe {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path,
-        [switch]$Recurse
-    )
+    param([Parameter(Mandatory)][string]$Path, [switch]$Recurse)
 
-    if (-not (Test-Path $Path)) {
-        Write-Log "Path not found: $Path" "WARN"
-        return
-    }
+    if (-not (Test-Path $Path)) { Write-Log "Path not found: $Path" "INFO"; return }
 
     try {
         if ($WhatIf) {
-            Write-Log "WhatIf: Would delete '$Path' (Recurse=$Recurse)"
+            Write-Log "WhatIf: Would delete '$Path'"
         } else {
             Remove-Item -LiteralPath $Path -Recurse:$Recurse -Force -ErrorAction Stop
-            Write-Log "Deleted '$Path'"
+            Write-Log "Deleted: $Path"
         }
-    } catch {
-        Write-Log "Failed to delete '$Path'. $_" "WARN"
+    }
+    catch {
+        Write-Log "Failed to delete '$Path': $_" "WARN"
     }
 }
 
 # ================================
-#  Check: Pending Reboot (CBS / WU only)
+# Pending Reboot Detection
 # ================================
 function Test-PendingReboot {
     $pending = $false
 
-    # CBS reboot pending
     if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
-        Write-Log "Pending reboot detected: Component Based Servicing" "WARN"
-        $pending = $true
+        Write-Log "Pending reboot: CBS" "WARN"; $pending = $true
     }
 
-    # Windows Update reboot pending
     if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
-        Write-Log "Pending reboot detected: Windows Update" "WARN"
-        $pending = $true
+        Write-Log "Pending reboot: Windows Update" "WARN"; $pending = $true
     }
 
-    # PendingFileRenameOperations is common (Chrome, etc.) -> LOG ONLY, DO NOT TRIP EXIT CODE
+    # Log-only (Chrome updates)
     try {
-        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
-        $value = Get-ItemProperty -Path $regPath -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue
-        if ($value -and $value.PendingFileRenameOperations) {
-            Write-Log "PendingFileRenameOperations present (common for app updates; not treated as a hard reboot block)." "INFO"
+        $value = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+        if ($value) {
+            Write-Log "PendingFileRenameOperations present (ignored)" "INFO"
         }
-    } catch {
-        Write-Log "Error checking PendingFileRenameOperations. $_" "WARN"
-    }
+    } catch {}
 
     return $pending
 }
 
 # ================================
-#  Check: Installer Busy (conservative)
+# Installer Busy Detection
 # ================================
 function Test-InstallerBusy {
     $busy = $false
 
     try {
         $procs = Get-CimInstance Win32_Process -Filter "Name='msiexec.exe'" -ErrorAction SilentlyContinue
-        if ($procs) {
-            $now = Get-Date
-            foreach ($p in $procs) {
-                $cmd = $p.CommandLine
-                $started = $null
-                try {
-                    if ($p.CreationDate) {
-                        $started = [Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate)
-                    }
-                } catch {}
+        $now = Get-Date
 
-                $ageMinutes = $null
-                if ($started) {
-                    $ageMinutes = ($now - $started).TotalMinutes
-                }
+        foreach ($p in $procs) {
+            $cmd = $p.CommandLine
+            $started = [Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate)
+            $age = ($now - $started).TotalMinutes
+            $recent = $age -le $InstallerBusyMinutes
 
-                $isRecent = $false
-                if ($ageMinutes -ne $null -and $ageMinutes -le $script:InstallerBusyMinutes) {
-                    $isRecent = $true
-                }
+            $installLike =
+                ($cmd -match '/i' -or
+                 $cmd -match '/x' -or
+                 $cmd -match '/f' -or
+                 $cmd -match '/update' -or
+                 $cmd -match 'INSTALL' -or
+                 $cmd -match 'UNINSTALL')
 
-                # Command line patterns that usually indicate real install/repair/uninstall work
-                $installLike = $false
-                if ($cmd -and (
-                        $cmd -match '/i' -or
-                        $cmd -match '/x' -or
-                        $cmd -match '/f' -or
-                        $cmd -match '/update' -or
-                        $cmd -match '/package' -or
-                        $cmd -match 'REBOOT=' -or
-                        $cmd -match 'INSTALL' -or
-                        $cmd -match 'UNINSTALL'
-                    )) {
-                    $installLike = $true
-                }
-
-                if ($isRecent -and $installLike) {
-                    Write-Log "Windows Installer busy: msiexec.exe (PID $($p.ProcessId)) started $started (~$([math]::Round($ageMinutes,1)) min ago) with install-like command line: $cmd" "WARN"
-                    $busy = $true
-                } else {
-                    Write-Log "msiexec.exe (PID $($p.ProcessId)) ignored as busy (Recent=$isRecent, InstallLike=$installLike). CmdLine: $cmd" "INFO"
-                }
+            if ($recent -and $installLike) {
+                Write-Log "Installer busy: PID=$($p.ProcessId) Started=$started Cmd=$cmd" "WARN"
+                $busy = $true
+            } else {
+                Write-Log "Ignoring msiexec PID $($p.ProcessId) (Recent=$recent InstallCmd=$installLike)" "INFO"
             }
-        } else {
-            Write-Log "No msiexec.exe processes detected." "INFO"
         }
     } catch {
-        Write-Log "Error checking msiexec.exe via Win32_Process. $_" "WARN"
+        Write-Log "Test-InstallerBusy failed: $_" "WARN"
     }
 
-    # Installer\InProgress key: log only, do NOT treat as hard block
-    try {
-        $key = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress"
-        if (Test-Path $key) {
-            Write-Log "Installer 'InProgress' key exists (logged for visibility, but not treated as a hard block)." "INFO"
-        }
-    } catch {
-        Write-Log "Error checking Installer InProgress key. $_" "WARN"
+    # Installer\InProgress: log-only
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress") {
+        Write-Log "Installer InProgress key present (ignored)" "INFO"
     }
 
     return $busy
 }
 
 # ================================
-#  Check: Office Click-to-Run Busy (conservative)
+# Office C2R Busy Detection
 # ================================
 function Test-OfficeClickToRunBusy {
     $busy = $false
 
     try {
-        # Look for processes that actually indicate Office install/repair/update, not the always-on service host
-        $procFilter = "Name='setup.exe' OR Name='OfficeC2RClient.exe' OR Name='IntegratedOffice.exe'"
-        $procs = Get-CimInstance Win32_Process -Filter $procFilter -ErrorAction SilentlyContinue
+        $procs = Get-CimInstance Win32_Process -Filter "Name='setup.exe' OR Name='OfficeC2RClient.exe' OR Name='IntegratedOffice.exe'" -ErrorAction SilentlyContinue
 
-        if ($procs) {
-            foreach ($p in $procs) {
-                $cmd = $p.CommandLine
-                if ($cmd -and ($cmd -match "Office" -or $cmd -match "ClickToRun" -or $cmd -match "C2R")) {
-                    Write-Log "Office Click-to-Run install/maintenance activity detected: $($p.Name) (PID $($p.ProcessId)) CMD: $cmd" "WARN"
-                    $busy = $true
-                } else {
-                    Write-Log "$($p.Name) (PID $($p.ProcessId)) does not look like Office C2R install; ignoring. CmdLine: $cmd" "INFO"
-                }
+        foreach ($p in $procs) {
+            $cmd = $p.CommandLine
+            if ($cmd -match "Office" -or $cmd -match "ClickToRun" -or $cmd -match "C2R") {
+                Write-Log "Office C2R install/repair detected: PID=$($p.ProcessId) Cmd=$cmd" "WARN"
+                $busy = $true
+            } else {
+                Write-Log "Ignoring process $($p.Name) PID $($p.ProcessId)" "INFO"
             }
-        } else {
-            Write-Log "No Office setup/repair processes detected (background OfficeClickToRun.exe is ignored)." "INFO"
         }
     } catch {
-        Write-Log "Error checking Office Click-to-Run activity. $_" "WARN"
+        Write-Log "Test-OfficeClickToRunBusy failed: $_" "WARN"
     }
 
     return $busy
 }
 
 # ================================
-#  Reset: Installer-related Services
+# Reset Services
 # ================================
 function Reset-InstallServices {
-    Write-Log "----- Resetting Installer-related services -----"
-    $errorDuringRestart = $false
+    Write-Log "Resetting installer-related services..."
+    $error = $false
 
-    $services = @(
-        "msiserver",      # Windows Installer
-        "ClickToRunSvc"   # Office C2R (if present)
-    )
-
-    foreach ($svcName in $services) {
+    foreach ($svcName in @("msiserver","ClickToRunSvc")) {
         try {
             $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-            if (-not $svc) {
-                Write-Log "Service '$svcName' not present (OK)" "INFO"
-                continue
-            }
+            if (-not $svc) { Write-Log "$svcName not present" "INFO"; continue }
 
             if ($svc.Status -eq "Running") {
-                Write-Log "Restarting service '$svcName'"
-                if (-not $WhatIf) {
-                    Restart-Service -Name $svcName -Force -ErrorAction Stop
-                } else {
-                    Write-Log "WhatIf: Would restart service '$svcName'"
-                }
+                Write-Log "Restarting $svcName"
+                if (-not $WhatIf) { Restart-Service $svcName -Force }
             } else {
-                Write-Log "Starting service '$svcName' (current state: $($svc.Status))"
-                if (-not $WhatIf) {
-                    Start-Service -Name $svcName -ErrorAction Stop
-                } else {
-                    Write-Log "WhatIf: Would start service '$svcName'"
-                }
+                Write-Log "Starting $svcName"
+                if (-not $WhatIf) { Start-Service $svcName }
             }
-        } catch {
-            Write-Log "Failed to restart/start '$svcName'. $_" "WARN"
-            $errorDuringRestart = $true
+        }
+        catch {
+            Write-Log "Service reset failed for $svcName: $_" "WARN"
+            $error = $true
         }
     }
-
-    return $errorDuringRestart
+    return $error
 }
 
 # ================================
-#  Cleanup: Temp Folders (current user + system)
+# Cleanup Functions
 # ================================
 function Clear-TempFolders {
-    Write-Log "----- Clearing temp folders (current user + system) -----"
-
-    $paths = @()
-
-    # Current user temp
-    if ($env:TEMP) { $paths += $env:TEMP }
-    if ($env:TMP)  { $paths += $env:TMP }
-
-    # System temp
-    $paths += "C:\Windows\Temp"
-
-    # Unique, existing paths only
-    $paths = $paths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
-
+    Write-Log "Clearing temp folders..."
+    $paths = @($env:TEMP, $env:TMP, "C:\Windows\Temp") | Where-Object { $_ -and (Test-Path $_) }
     foreach ($path in $paths) {
-        Write-Log "Cleaning temp path: $path"
-        try {
-            $items = Get-ChildItem -Path $path -Force -ErrorAction SilentlyContinue
-            foreach ($item in $items) {
-                Remove-ItemSafe -Path $item.FullName -Recurse
-            }
-        } catch {
-            Write-Log "Error while cleaning temp path '$path'. $_" "WARN"
+        Get-ChildItem $path -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-ItemSafe $_.FullName -Recurse
         }
     }
 }
 
-# ================================
-#  Cleanup: All User Profile Temp Folders
-# ================================
 function Clear-UserProfileTempFolders {
-    Write-Log "----- Clearing temp folders for all user profiles -----"
-
-    $profileRoot = "C:\Users"
-    if (-not (Test-Path $profileRoot)) {
-        Write-Log "Profile root '$profileRoot' not found; skipping user profile temp cleanup." "WARN"
-        return
-    }
-
-    $excludeNames = @(
-        "Public",
-        "Default",
-        "Default User",
-        "All Users"
-    )
-
-    $profiles = Get-ChildItem -Path $profileRoot -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $excludeNames -notcontains $_.Name }
+    Write-Log "Clearing all user profile temp folders..."
+    $profiles = Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin "Public","Default","Default User","All Users" }
 
     foreach ($profile in $profiles) {
         $tempPath = Join-Path $profile.FullName "AppData\Local\Temp"
         if (Test-Path $tempPath) {
-            Write-Log "Cleaning profile temp path: $tempPath"
-            try {
-                $items = Get-ChildItem -Path $tempPath -Force -ErrorAction SilentlyContinue
-                foreach ($item in $items) {
-                    Remove-ItemSafe -Path $item.FullName -Recurse
-                }
-            } catch {
-                Write-Log "Error while cleaning '$tempPath'. $_" "WARN"
+            Get-ChildItem $tempPath -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                Remove-ItemSafe $_.FullName -Recurse
             }
-        } else {
-            Write-Log "Profile temp path not found: $tempPath" "INFO"
         }
     }
 }
 
-# ================================
-#  Cleanup: Windows Update Cache
-# ================================
 function Clear-WindowsUpdateCache {
-    Write-Log "----- Clearing Windows Update download cache -----"
+    Write-Log "Clearing Windows Update cache..."
+    $path = "C:\Windows\SoftwareDistribution\Download"
 
-    $wuDownload = "C:\Windows\SoftwareDistribution\Download"
-    if (-not (Test-Path $wuDownload)) {
-        Write-Log "Windows Update download folder not found at '$wuDownload'." "WARN"
-        return
-    }
+    $svcNames = @("wuauserv","bits")
+    $stopped = @()
 
-    $serviceNames = @("wuauserv","bits")
-    $stoppedServices = @()
-
-    foreach ($svcName in $serviceNames) {
-        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-        if ($svc -and $svc.Status -eq 'Running') {
-            if ($WhatIf) {
-                Write-Log "WhatIf: Would stop service '$svcName'"
-            } else {
-                try {
-                    Write-Log "Stopping service '$svcName'"
-                    Stop-Service -Name $svcName -Force -ErrorAction Stop
-                    $stoppedServices += $svcName
-                } catch {
-                    Write-Log "Failed to stop service '$svcName'. $_" "WARN"
+    foreach ($svc in $svcNames) {
+        try {
+            if ((Get-Service $svc -ErrorAction SilentlyContinue).Status -eq "Running") {
+                Write-Log "Stopping $svc"
+                if (-not $WhatIf) {
+                    Stop-Service $svc -Force
+                    $stopped += $svc
                 }
             }
+        } catch {}
+    }
+
+    if (Test-Path $path) {
+        Get-ChildItem $path -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-ItemSafe $_.FullName -Recurse
         }
     }
 
-    try {
-        Write-Log "Cleaning '$wuDownload'"
-        $items = Get-ChildItem -Path $wuDownload -Force -ErrorAction SilentlyContinue
-        foreach ($item in $items) {
-            Remove-ItemSafe -Path $item.FullName -Recurse
-        }
-    } catch {
-        Write-Log "Error while cleaning Windows Update cache. $_" "WARN"
-    }
-
-    foreach ($svcName in $stoppedServices) {
-        if ($WhatIf) {
-            Write-Log "WhatIf: Would restart service '$svcName'"
-        } else {
-            try {
-                Write-Log "Restarting service '$svcName'"
-                Start-Service -Name $svcName -ErrorAction Stop
-            } catch {
-                Write-Log "Failed to restart service '$svcName'. $_" "WARN"
-            }
-        }
+    foreach ($svc in $stopped) {
+        Write-Log "Restarting $svc"
+        if (-not $WhatIf) { Start-Service $svc }
     }
 }
 
-# ================================
-#  Cleanup: Delivery Optimization Cache
-# ================================
 function Clear-DeliveryOptimizationCache {
-    Write-Log "----- Clearing Delivery Optimization cache -----"
+    Write-Log "Clearing Delivery Optimization cache..."
+    $path = "C:\ProgramData\Microsoft\Windows\DeliveryOptimization\Cache"
 
-    $doCache = "C:\ProgramData\Microsoft\Windows\DeliveryOptimization\Cache"
-    if (-not (Test-Path $doCache)) {
-        Write-Log "Delivery Optimization cache not found at '$doCache'." "INFO"
-        return
-    }
-
-    $svcName = "DoSvc"
-    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-    $stopped = $false
-
-    if ($svc -and $svc.Status -eq 'Running') {
-        if ($WhatIf) {
-            Write-Log "WhatIf: Would stop service '$svcName'"
-        } else {
-            try {
-                Write-Log "Stopping service '$svcName'"
-                Stop-Service -Name $svcName -Force -ErrorAction Stop
-                $stopped = $true
-            } catch {
-                Write-Log "Failed to stop service '$svcName'. $_" "WARN"
-            }
-        }
-    }
-
-    try {
-        Write-Log "Cleaning '$doCache'"
-        $items = Get-ChildItem -Path $doCache -Force -ErrorAction SilentlyContinue
-        foreach ($item in $items) {
-            Remove-ItemSafe -Path $item.FullName -Recurse
-        }
-    } catch {
-        Write-Log "Error while cleaning Delivery Optimization cache. $_" "WARN"
-    }
-
-    if ($stopped) {
-        if ($WhatIf) {
-            Write-Log "WhatIf: Would restart service '$svcName'"
-        } else {
-            try {
-                Write-Log "Restarting service '$svcName'"
-                Start-Service -Name $svcName -ErrorAction Stop
-            } catch {
-                Write-Log "Failed to restart service '$svcName'. $_" "WARN"
-            }
+    if (Test-Path $path) {
+        Get-ChildItem $path -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-ItemSafe $_.FullName -Recurse
         }
     }
 }
 
-# ================================
-#  Cleanup: Office Click-to-Run Logs / Telemetry / Cache
-# ================================
 function Clear-OfficeClickToRunJunk {
-    Write-Log "----- Clearing Office Click-to-Run logs/telemetry/cache (safe) -----"
+    Write-Log "Clearing Office Click-to-Run logs and telemetry..."
 
-    # ProgramData-level C2R logging/telemetry
-    $programDataPaths = @(
+    $paths = @(
         "C:\ProgramData\Microsoft\Office\ClickToRun\Log",
         "C:\ProgramData\Microsoft\Office\ClickToRun\Telemetry",
         "C:\ProgramData\Microsoft\ClickToRun\Log",
@@ -551,203 +354,130 @@ function Clear-OfficeClickToRunJunk {
         "C:\ProgramData\Microsoft\ClickToRun\Logs"
     )
 
-    foreach ($path in $programDataPaths) {
+    foreach ($path in $paths) {
         if (Test-Path $path) {
-            Write-Log "Cleaning ClickToRun path: $path"
-            try {
-                $items = Get-ChildItem -Path $path -Force -ErrorAction SilentlyContinue
-                foreach ($item in $items) {
-                    Remove-ItemSafe -Path $item.FullName -Recurse
-                }
-            } catch {
-                Write-Log "Error while cleaning '$path'. $_" "WARN"
+            Get-ChildItem $path -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                Remove-ItemSafe $_.FullName -Recurse
             }
-        } else {
-            Write-Log "ClickToRun path not found: $path" "INFO"
         }
     }
 
-    # Per-user Office cache/logging for Click-to-Run (16.0 covers Office 2016–2021 + M365)
-    $localBase = Join-Path $env:LOCALAPPDATA "Microsoft\Office"
-    if (Test-Path $localBase) {
-        $localSubPaths = @(
-            "16.0\OfficeFileCache",
-            "16.0\Wef",
-            "16.0\Telemetry",
-            "16.0\Lync\Tracing"
-        )
+    # Per-user Office cache
+    $localBase = Join-Path $env:LOCALAPPDATA "Microsoft\Office\16.0"
+    $subPaths = "OfficeFileCache","Wef","Telemetry","Lync\Tracing"
 
-        foreach ($sub in $localSubPaths) {
-            $full = Join-Path $localBase $sub
-            if (Test-Path $full) {
-                Write-Log "Cleaning per-user Office cache path: $full"
-                try {
-                    $items = Get-ChildItem -Path $full -Force -ErrorAction SilentlyContinue
-                    foreach ($item in $items) {
-                        Remove-ItemSafe -Path $item.FullName -Recurse
-                    }
-                } catch {
-                    Write-Log "Error while cleaning '$full'. $_" "WARN"
-                }
-            } else {
-                Write-Log "Per-user Office cache path not found: $full" "INFO"
+    foreach ($sub in $subPaths) {
+        $full = Join-Path $localBase $sub
+        if (Test-Path $full) {
+            Get-ChildItem $full -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                Remove-ItemSafe $_.FullName -Recurse
             }
         }
-    } else {
-        Write-Log "Per-user Office base folder not found at '$localBase'." "INFO"
     }
 }
 
-# ================================
-#  Cleanup: Old System Logs (CBS / DISM / MoSetup / Temp CAB)
-# ================================
 function Clear-OldSystemLogs {
-    Write-Log "----- Clearing old CBS/DISM/MoSetup logs and CABs -----"
-
+    Write-Log "Clearing CBS/DISM/MoSetup logs..."
     $patterns = @(
         "C:\Windows\Logs\CBS\*.cab",
         "C:\Windows\Logs\CBS\CbsPersist_*.log",
         "C:\Windows\Logs\DISM\*.log.old",
-        "C:\Windows\Logs\DISM\*.bak",
-        "C:\Windows\Temp\*.log",
-        "C:\Windows\Temp\*.cab",
         "C:\Windows\Logs\MoSetup\*.log"
     )
-
     foreach ($pattern in $patterns) {
-        try {
-            $files = Get-ChildItem -Path $pattern -Force -ErrorAction SilentlyContinue
-            foreach ($file in $files) {
-                Remove-ItemSafe -Path $file.FullName
-            }
-        } catch {
-            Write-Log "Error while cleaning files matching '$pattern'. $_" "WARN"
+        Get-ChildItem $pattern -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-ItemSafe $_.FullName
         }
     }
 }
 
-# ================================
-#  Cleanup: Windows Installer Logs / Temp (not MSI/MSP cache)
-# ================================
 function Clear-WindowsInstallerLogs {
-    Write-Log "----- Clearing Windows Installer logs/temp files (not MSI/MSP cache) -----"
-
-    $installerRoot = "C:\Windows\Installer"
-    if (-not (Test-Path $installerRoot)) {
-        Write-Log "Windows Installer folder not found at '$installerRoot'." "WARN"
-        return
-    }
-
-    $patterns = @(
-        "*.log",
-        "*.tmp"
-    )
-
-    foreach ($pattern in $patterns) {
-        try {
-            $files = Get-ChildItem -Path $installerRoot -Filter $pattern -File -Force -ErrorAction SilentlyContinue
-            foreach ($file in $files) {
-                Remove-ItemSafe -Path $file.FullName
-            }
-        } catch {
-            Write-Log "Error while cleaning Windows Installer files '$pattern'. $_" "WARN"
+    Write-Log "Clearing Windows Installer logs/temp..."
+    $root = "C:\Windows\Installer"
+    if (Test-Path $root) {
+        Get-ChildItem $root -Filter "*.log" -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-ItemSafe $_.FullName
+        }
+        Get-ChildItem $root -Filter "*.tmp" -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-ItemSafe $_.FullName
         }
     }
 }
 
-# ================================
-#  Cleanup: Recycle Bin
-# ================================
 function Clear-RecycleBinSafe {
-    Write-Log "----- Clearing Recycle Bin -----"
-
     if ($SkipRecycleBin) {
-        Write-Log "SkipRecycleBin is set; skipping Recycle Bin cleanup."
+        Write-Log "Skipping Recycle Bin cleanup (SkipRecycleBin used)"
         return
     }
+
+    Write-Log "Clearing Recycle Bin..."
 
     try {
         if ($WhatIf) {
-            Write-Log "WhatIf: Would clear Recycle Bin."
+            Write-Log "WhatIf: Would clear Recycle Bin"
         } else {
             Clear-RecycleBin -Force -ErrorAction SilentlyContinue
-            Write-Log "Recycle Bin cleared."
         }
     } catch {
-        Write-Log "Failed to clear Recycle Bin. $_" "WARN"
+        Write-Log "Recycle Bin cleanup failed: $_" "WARN"
     }
 }
 
-# ================================
-#  Aggressive Cleanup (Optional)
-# ================================
 function Invoke-AggressiveCleanup {
-    Write-Log "----- Running Aggressive Cleanup -----"
-
-    # Windows Error Reporting (WER) queue
-    $werRoot = "C:\ProgramData\Microsoft\Windows\WER"
-    if (Test-Path $werRoot) {
-        Write-Log "Cleaning Windows Error Reporting queue at '$werRoot'"
-        try {
-            $items = Get-ChildItem -Path $werRoot -Recurse -Force -ErrorAction SilentlyContinue
-            foreach ($item in $items) {
-                Remove-ItemSafe -Path $item.FullName -Recurse
-            }
-        } catch {
-            Write-Log "Error while cleaning Windows Error Reporting queue. $_" "WARN"
+    Write-Log "Running aggressive cleanup..."
+    $wer = "C:\ProgramData\Microsoft\Windows\WER"
+    if (Test-Path $wer) {
+        Get-ChildItem $wer -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-ItemSafe $_.FullName -Recurse
         }
-    } else {
-        Write-Log "WER root folder not found at '$werRoot'." "INFO"
     }
-
-    # Add additional aggressive, known-safe cleanup targets here if desired.
 }
 
 # ================================
-#  MAIN EXECUTION
+# MAIN EXECUTION
 # ================================
 $exitCode = 0
 
-# Pre-flight checks
-if (Test-PendingReboot) {
-    Write-Log "Pending reboot detected — installation should not proceed." "WARN"
-    $exitCode = 20
-} else {
-    Write-Log "No reboot-pending indicators detected (CBS/Windows Update)."
+if (-not $SkipPreflight) {
+
+    if (Test-PendingReboot) {
+        Write-Log "Pre-flight FAILED: Pending reboot" "WARN"
+        $exitCode = 20
+    }
+
+    if (Test-InstallerBusy) {
+        Write-Log "Pre-flight FAILED: Installer busy" "WARN"
+        if ($exitCode -eq 0) { $exitCode = 21 }
+    }
+
+    if (Test-OfficeClickToRunBusy) {
+        Write-Log "Pre-flight FAILED: Office C2R busy" "WARN"
+        if ($exitCode -eq 0) { $exitCode = 22 }
+    }
+
+    if ($exitCode -eq 0) {
+        $svcErrors = Reset-InstallServices
+        if ($svcErrors) {
+            Write-Log "Pre-flight FAILED: Service restart issue" "WARN"
+            $exitCode = 23
+        }
+    }
+
+    if ($exitCode -ne 0) {
+        Write-Log "Pre-flight failed. ExitCode=$exitCode"
+        Write-Log "============================================================="
+        exit $exitCode
+    }
+
+    Write-Log "Pre-flight checks passed. Proceeding with cleanup..."
+}
+else {
+    Write-Log "SkipPreflight used — performing cleanup only"
 }
 
-if (Test-InstallerBusy) {
-    Write-Log "Windows Installer is busy — installation should not proceed." "WARN"
-    if ($exitCode -eq 0) { $exitCode = 21 }
-} else {
-    Write-Log "No active Windows Installer activity detected (per conservative rules)."
-}
-
-if (Test-OfficeClickToRunBusy) {
-    Write-Log "Office Click-to-Run installer/maintenance activity detected." "WARN"
-    if ($exitCode -eq 0) { $exitCode = 22 }
-} else {
-    Write-Log "No obvious Office Click-to-Run install activity detected."
-}
-
-$svcErrors = Reset-InstallServices
-if ($svcErrors) {
-    Write-Log "One or more installer services failed to restart/start cleanly." "WARN"
-    if ($exitCode -eq 0) { $exitCode = 23 }
-}
-
-if ($exitCode -ne 0) {
-    Write-Log "Pre-flight checks indicate system is NOT ready for installation. ExitCode=$exitCode"
-    Write-Log "Cleanup will be skipped due to pre-flight failure."
-    Write-Log "============================================================="
-    Write-Host ""
-    Write-Host "Pre-flight failed. ExitCode: $exitCode" -ForegroundColor Yellow
-    Write-Host "See log for details: $script:LogFile" -ForegroundColor Yellow
-    exit $exitCode
-}
-
-Write-Log "System passes pre-flight checks. Proceeding with cleanup..."
-
+# ================================
+# RUN CLEANUP
+# ================================
 try {
     Clear-TempFolders
     Clear-UserProfileTempFolders
@@ -761,32 +491,37 @@ try {
     if ($Aggressive) {
         Invoke-AggressiveCleanup
     }
-} catch {
-    Write-Log "Unexpected error during cleanup: $_" "ERROR"
+}
+catch {
+    Write-Log "Unexpected cleanup error: $_" "ERROR"
     if ($exitCode -eq 0) { $exitCode = 1 }
 }
 
+# ================================
+# FINAL SPACE CALC
+# ================================
 $finalFree = Get-SystemDriveFreeSpace
 $delta = $finalFree - $initialFree
 
-# If free space decreased slightly during the run (normal OS churn), don't show a negative "reclaimed" value
 if ($delta -lt 0) {
-    Write-Log "Note: free space decreased by $(Format-Bytes ([math]::Abs($delta))) during script execution (normal background activity). Reporting 0 B reclaimed." "INFO"
+    Write-Log "SYSTEM CHURN: Free space decreased by $(Format-Bytes ([math]::Abs($delta))) during run. Reporting 0 B reclaimed." "INFO"
     $deltaShown = 0
-} else {
+}
+else {
     $deltaShown = $delta
 }
 
-Write-Log "Final free space on system drive ($env:SystemDrive): $(Format-Bytes $finalFree)"
-Write-Log "Approximate space reclaimed: $(Format-Bytes $deltaShown)"
-Write-Log "Cleanup script finished with ExitCode=$exitCode."
+Write-Log "Final free space: $(Format-Bytes $finalFree)"
+Write-Log "Space reclaimed: $(Format-Bytes $deltaShown)"
+Write-Log "ExitCode: $exitCode"
 Write-Log "Log file: $script:LogFile"
 Write-Log "============================================================="
 
-Write-Host ""
-Write-Host "Cleanup complete. Approx. space reclaimed: $(Format-Bytes $deltaShown)" -ForegroundColor Cyan
-Write-Host "Pre-flight ExitCode: $exitCode" -ForegroundColor Cyan
-Write-Host "Log file: $script:LogFile" -ForegroundColor Cyan
+if (-not $Silent) {
+    Write-Host ""
+    Write-Host "Cleanup complete." -ForegroundColor Cyan
+    Write-Host "Reclaimed: $(Format-Bytes $deltaShown)" -ForegroundColor Cyan
+    Write-Host "Log file: $script:LogFile" -ForegroundColor DarkGray
+}
 
 exit $exitCode
-
