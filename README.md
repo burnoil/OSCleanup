@@ -33,3 +33,7 @@
     Suppresses all console output. Script still writes full logs.
 
 # Example - C:\OSCleanupCLI.ps1 -Silent
+
+## GUI
+
+<img width="881" height="730" alt="image" src="https://github.com/user-attachments/assets/12c2857d-467f-460b-8701-f4be89f6b7b2" />
