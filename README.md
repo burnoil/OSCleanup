@@ -14,6 +14,13 @@
     - Supports silent operation via -Silent
     - Logging to %ProgramData%\OSCleanup
 
+    0  Success (or preflight skipped)
+    1  General script error
+    20 Pending reboot
+    21 Installer busy
+    22 Office C2R busy
+    23 Installer service restart failure
+
 .PARAMETER Aggressive
     Enables additional cleanup (WER queue, etc).
 
