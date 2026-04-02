@@ -12,7 +12,7 @@
     - BigFix deployment compatible
 
 .NOTES
-    Author: MIT Lincoln Laboratory
+    Author: BURNOIL
     Version: 1.0
     Requires: PowerShell 5.1+, .NET Framework 4.5+
 #>
